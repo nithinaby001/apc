@@ -1,0 +1,188 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <base target="_top" />
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Personal Finance Manager</title>
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet" />
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <style>
+    body{background:#f4f6f9}.section{display:none}.section.active{display:block}.table-wrap{max-height:430px;overflow:auto}
+    .card canvas{height:280px!important}.small-muted{font-size:.85rem;color:#6c757d}
+  </style>
+</head>
+<body>
+<div class="container py-3">
+  <h3 class="mb-0">Personal Finance Manager</h3>
+  <div class="small-muted mb-3">Google Sheets + Google Apps Script</div>
+  <ul class="nav nav-pills gap-2 mb-3" id="topNav"></ul>
+  <section id="dashboard" class="section active"></section>
+  <section id="expense" class="section"></section>
+  <section id="income" class="section"></section>
+  <section id="import" class="section"></section>
+  <section id="transactions" class="section"></section>
+  <section id="reports" class="section"></section>
+  <section id="settings" class="section"></section>
+</div>
+
+<script>
+const state={categories:[],accounts:[],rules:[],transactions:[],dashboard:null,reports:null,charts:{},selectedTx:new Set(),parsedRows:[]};
+const pages=[['dashboard','Dashboard'],['expense','Add Expense'],['income','Add Income'],['import','Import Statement'],['transactions','Transactions'],['reports','Reports'],['settings','Settings']];
+
+document.addEventListener('DOMContentLoaded', async()=>{renderNav(); await refreshAll();});
+
+function gas(fn,payload){
+  return new Promise((resolve,reject)=>{
+    if (!(window.google && google.script && google.script.run)) {
+      reject(new Error('This page must run as a Google Apps Script Web App (google.script.run unavailable).'));
+      return;
+    }
+    google.script.run.withSuccessHandler(resolve).withFailureHandler(reject)[fn](payload);
+  });
+}
+
+async function api(fn,payload){
+  try{return await gas(fn,payload);}catch(e){alert(e.message||e);throw e;}
+}
+
+async function refreshAll(){
+  const [categories,accounts,rules,dashboard,transactions,reports]=await Promise.all([
+    api('getCategories'),api('getAccounts'),api('getCategoryRules'),api('getDashboardData'),api('getTransactions'),api('getFinancialReports')
+  ]);
+  Object.assign(state,{categories,accounts,rules,dashboard,transactions,reports});
+  renderDashboard();renderEntryForms();renderImport();renderTransactions();renderReports();renderSettings();
+}
+
+function renderNav(){
+  document.getElementById('topNav').innerHTML=pages.map(([id,l],i)=>`<li><button class="btn ${i===0?'btn-primary':'btn-outline-primary'}" onclick="showPage('${id}',this)">${l}</button></li>`).join('');
+}
+function showPage(id,btn){document.querySelectorAll('.section').forEach(s=>s.classList.remove('active'));document.getElementById(id).classList.add('active');document.querySelectorAll('#topNav .btn').forEach(b=>{b.classList.remove('btn-primary');b.classList.add('btn-outline-primary')});btn.classList.remove('btn-outline-primary');btn.classList.add('btn-primary');}
+const money=v=>new Intl.NumberFormat('en-US',{style:'currency',currency:'USD'}).format(Number(v||0));
+
+function renderDashboard(){
+  const d=state.dashboard||{summary:{},charts:{},recentTransactions:[]};
+  document.getElementById('dashboard').innerHTML=`
+  <div class="row g-3 mb-3">
+    ${card('Current Balance',money(d.summary.currentBalance),'primary')}
+    ${card('Income (Month)',money(d.summary.totalIncomeMonth),'success')}
+    ${card('Expense (Month)',money(d.summary.totalExpensesMonth),'danger')}
+    ${card('Savings',money(d.summary.savings),'info')}
+  </div>
+  <div class="row g-3 mb-3">
+    <div class="col-12 col-lg-6"><div class="card"><div class="card-body"><h6>Monthly Expense Trend</h6><canvas id="cExpense"></canvas></div></div></div>
+    <div class="col-12 col-lg-6"><div class="card"><div class="card-body"><h6>Income vs Expense</h6><canvas id="cIncomeExp"></canvas></div></div></div>
+  </div>
+  <div class="row g-3 mb-3">
+    <div class="col-12 col-lg-6"><div class="card"><div class="card-body"><h6>Category Breakdown</h6><canvas id="cCategory"></canvas></div></div></div>
+    <div class="col-12 col-lg-6"><div class="card"><div class="card-body"><h6>Recent Transactions</h6>${recentTable(d.recentTransactions)}</div></div></div>
+  </div>`;
+  chart('cExpense','line',{labels:(d.charts.expenseTrend||[]).map(x=>x.month),datasets:[{label:'Expense',data:(d.charts.expenseTrend||[]).map(x=>x.value),borderColor:'#dc3545'}]});
+  chart('cIncomeExp','bar',{labels:(d.charts.incomeExpense||[]).map(x=>x.month),datasets:[{label:'Income',data:(d.charts.incomeExpense||[]).map(x=>x.income),backgroundColor:'#198754'},{label:'Expense',data:(d.charts.incomeExpense||[]).map(x=>x.expense),backgroundColor:'#dc3545'}]});
+  chart('cCategory','pie',{labels:(d.charts.categoryBreakdown||[]).map(x=>x.category),datasets:[{data:(d.charts.categoryBreakdown||[]).map(x=>x.amount)}]});
+}
+function card(t,v,c){return `<div class="col-6 col-lg-3"><div class="card"><div class="card-body"><div class="small-muted">${t}</div><div class="fs-5 fw-bold text-${c}">${v}</div></div></div></div>`}
+function recentTable(rows){if(!rows?.length)return '<div class="small-muted">No transactions yet.</div>';return `<div class="table-responsive"><table class="table table-sm"><thead><tr><th>Date</th><th>Description</th><th>Type</th><th>Category</th><th>Amount</th></tr></thead><tbody>${rows.map(r=>`<tr><td>${r.date}</td><td>${r.description}</td><td>${r.type}</td><td>${r.category||'-'}</td><td>${money(r.amount)}</td></tr>`).join('')}</tbody></table></div>`}
+
+function renderEntryForms(){document.getElementById('expense').innerHTML=entryForm('Expense');document.getElementById('income').innerHTML=entryForm('Income');}
+function entryForm(type){
+  const cats=state.categories.filter(c=>c.type===type&&c.active).map(c=>`<option>${c.name}</option>`).join('');
+  const acs=state.accounts.map(a=>`<option>${a.name}</option>`).join('');
+  return `<div class="card"><div class="card-body"><h5>Add ${type}</h5>
+  <form id="f${type}" onsubmit="saveEntry(event,'${type}')"><div class="row g-3">
+  <div class="col-md-4"><label class="form-label">Date</label><input required name="date" type="date" class="form-control" value="${new Date().toISOString().slice(0,10)}"></div>
+  <div class="col-md-8"><label class="form-label">Description</label><input required name="description" class="form-control"></div>
+  <div class="col-md-4"><label class="form-label">Amount</label><input required min="0.01" step="0.01" name="amount" type="number" class="form-control"></div>
+  <div class="col-md-4"><label class="form-label">Category</label><select required name="category" class="form-select"><option value="">Select</option>${cats}</select></div>
+  ${type==='Expense'?'<div class="col-md-4"><label class="form-label">Subcategory</label><input name="subcategory" class="form-control"></div>':''}
+  <div class="col-md-6"><label class="form-label">Account</label><select name="account" class="form-select"><option value="">Select</option>${acs}</select></div>
+  <div class="col-12"><label class="form-label">Notes</label><textarea name="notes" class="form-control"></textarea></div>
+  </div><div class="mt-3 d-flex gap-2"><button class="btn btn-primary" type="submit">Save</button><button class="btn btn-success" type="button" onclick="saveEntry(null,'${type}',true)">Save & Add New</button><button class="btn btn-outline-secondary" type="reset">Cancel</button></div></form></div></div>`;
+}
+async function saveEntry(e,type,keep){if(e)e.preventDefault();const f=document.getElementById('f'+type);if(!f.reportValidity())return;const p=Object.fromEntries(new FormData(f).entries());p.amount=Number(p.amount||0);await api(type==='Expense'?'addExpense':'addIncome',p);await refreshAll();if(keep)f.reset();alert('Saved');}
+
+function renderImport(){
+  const acs=state.accounts.map(a=>`<option>${a.name}</option>`).join('');
+  document.getElementById('import').innerHTML=`<div class="card"><div class="card-body"><h5>Bank Statement Import</h5>
+  <p class="small-muted">Upload CSV/TSV with columns Date, Description, Debit, Credit.</p>
+  <div class="row g-3"><div class="col-md-4"><label class="form-label">Account</label><select id="importAcc" class="form-select"><option value="">Select</option>${acs}</select></div>
+  <div class="col-md-8"><label class="form-label">File</label><input id="fileInput" type="file" class="form-control" accept=".csv,.txt,.tsv"></div></div>
+  <div class="mt-3 d-flex gap-2"><button class="btn btn-primary" onclick="previewImport()">Preview</button><button class="btn btn-success" onclick="runImport()">Confirm Import</button></div>
+  <div id="importPreview" class="mt-3"></div></div></div>`;
+}
+async function previewImport(){
+  const f=document.getElementById('fileInput');if(!f.files.length){alert('Select a file');return;}
+  const text=await f.files[0].text();const lines=text.split(/\r?\n/).filter(Boolean);if(lines.length<2){alert('File has no data');return;}
+  const delim=(lines[0].split(';').length>lines[0].split(',').length)?';':((lines[0].split('\t').length>lines[0].split(',').length)?'\t':',');
+  const head=lines[0].split(delim).map(h=>h.trim().toLowerCase());
+  const idx={date:head.indexOf('date'),description:head.indexOf('description'),debit:head.indexOf('debit'),credit:head.indexOf('credit')};
+  if(Object.values(idx).some(v=>v===-1)){alert('Missing required headers: Date, Description, Debit, Credit');return;}
+  state.parsedRows=lines.slice(1).map(l=>{const c=l.split(delim);return {date:c[idx.date],description:c[idx.description],debit:Number(c[idx.debit]||0),credit:Number(c[idx.credit]||0)}}).filter(r=>r.date&&r.description);
+  document.getElementById('importPreview').innerHTML=`<h6>Preview (${state.parsedRows.length} rows)</h6><div class="table-wrap"><table class="table table-sm"><thead><tr><th>Date</th><th>Description</th><th>Debit</th><th>Credit</th></tr></thead><tbody>${state.parsedRows.slice(0,60).map(r=>`<tr><td>${r.date}</td><td>${r.description}</td><td>${r.debit}</td><td>${r.credit}</td></tr>`).join('')}</tbody></table></div>`;
+}
+async function runImport(){if(!state.parsedRows.length){alert('Preview first');return;}const res=await api('uploadBankStatement',{rows:state.parsedRows,account:document.getElementById('importAcc').value});alert(`Imported ${res.count} rows`);state.parsedRows=[];await refreshAll();}
+
+function renderTransactions(){
+  const cats=state.categories.map(c=>`<option>${c.name}</option>`).join('');const acc=state.accounts.map(a=>`<option>${a.name}</option>`).join('');
+  document.getElementById('transactions').innerHTML=`<div class="card"><div class="card-body"><h5>Transaction Management</h5>
+  <div class="row g-2 mb-2"><div class="col-md-2"><input type="date" id="fStart" class="form-control"></div><div class="col-md-2"><input type="date" id="fEnd" class="form-control"></div>
+  <div class="col-md-2"><select id="fType" class="form-select"><option value="">All Types</option><option>Income</option><option>Expense</option></select></div>
+  <div class="col-md-2"><select id="fCat" class="form-select"><option value="">All Categories</option>${cats}</select></div>
+  <div class="col-md-2"><select id="fAcc" class="form-select"><option value="">All Accounts</option>${acc}</select></div>
+  <div class="col-md-2"><input id="fSearch" class="form-control" placeholder="Search"></div></div>
+  <div class="d-flex gap-2 flex-wrap mb-2"><button class="btn btn-primary btn-sm" onclick="applyTxFilters()">Apply</button><button class="btn btn-outline-secondary btn-sm" onclick="refreshAll()">Reset</button><button class="btn btn-warning btn-sm" onclick="autoCategorize()">Auto Categorize</button>
+  <select id="bulkCategory" class="form-select form-select-sm" style="width:220px"><option value="">Bulk category...</option>${cats}</select><button class="btn btn-info btn-sm" onclick="applyBulkCategory()">Apply Bulk Category</button></div>
+  <div id="txTable">${txTable(state.transactions)}</div></div></div>`;
+}
+function txTable(rows){if(!rows.length)return '<div class="small-muted">No transactions found.</div>';return `<div class="table-wrap"><table class="table table-sm table-hover"><thead><tr><th><input type="checkbox" onchange="toggleAll(this.checked)"></th><th>Date</th><th>Description</th><th>Type</th><th>Category</th><th>Amount</th><th>Source</th><th>Actions</th></tr></thead><tbody>${rows.map(r=>`<tr><td><input type="checkbox" ${state.selectedTx.has(r.id)?'checked':''} onchange="toggleTx('${r.id}',this.checked)"></td><td>${r.date}</td><td>${r.description}</td><td>${r.type}</td><td>${r.category||'-'}</td><td>${money(r.amount)}</td><td>${r.source||'-'}</td><td><button class="btn btn-outline-primary btn-sm" onclick="openEditById('${r.id}')">Edit</button> <button class="btn btn-outline-danger btn-sm" onclick="removeTx('${r.id}')">Delete</button></td></tr>`).join('')}</tbody></table></div>`}
+function toggleTx(id,on){if(on)state.selectedTx.add(id);else state.selectedTx.delete(id)}
+function toggleAll(on){state.transactions.forEach(t=>on?state.selectedTx.add(t.id):state.selectedTx.delete(t.id));document.getElementById('txTable').innerHTML=txTable(state.transactions)}
+async function applyTxFilters(){const f={startDate:v('fStart'),endDate:v('fEnd'),type:v('fType'),category:v('fCat'),account:v('fAcc'),search:v('fSearch')};state.transactions=await api('getTransactions',f);document.getElementById('txTable').innerHTML=txTable(state.transactions)}
+function v(id){return document.getElementById(id)?.value||''}
+async function autoCategorize(){const r=await api('categorizeTransactions');alert(`Updated ${r.updatedCount}`);await refreshAll();}
+async function applyBulkCategory(){const category=v('bulkCategory');if(!category||!state.selectedTx.size){alert('Select transactions + category');return;}const r=await api('bulkUpdateCategory',{ids:Array.from(state.selectedTx),category});alert(`Updated ${r.updated}`);state.selectedTx.clear();await refreshAll();}
+async function removeTx(id){if(!confirm('Delete transaction?'))return;await api('deleteTransaction',id);await refreshAll();}
+function openEditById(id){const tx=state.transactions.find(t=>t.id===id);if(tx)openEdit(tx);}
+
+function openEdit(tx){
+  const cats=state.categories.filter(c=>c.type===tx.type).map(c=>`<option ${c.name===tx.category?'selected':''}>${c.name}</option>`).join('');
+  const acs=state.accounts.map(a=>`<option ${a.name===tx.account?'selected':''}>${a.name}</option>`).join('');
+  const html=`<div class="modal fade" id="editModal" tabindex="-1"><div class="modal-dialog"><div class="modal-content"><div class="modal-header"><h5 class="modal-title">Edit Transaction</h5><button class="btn-close" data-bs-dismiss="modal"></button></div>
+  <div class="modal-body"><form id="editForm"><input name="id" value="${tx.id}" type="hidden"><input name="type" value="${tx.type}" type="hidden"><div class="mb-2"><label class="form-label">Date</label><input name="date" type="date" class="form-control" value="${tx.date}" required></div>
+  <div class="mb-2"><label class="form-label">Description</label><input name="description" class="form-control" value="${(tx.description||'').replace(/"/g,'&quot;')}" required></div>
+  <div class="mb-2"><label class="form-label">Amount</label><input name="amount" type="number" min="0.01" step="0.01" class="form-control" value="${tx.amount}" required></div>
+  <div class="mb-2"><label class="form-label">Category</label><select name="category" class="form-select"><option value="">Select</option>${cats}</select></div>
+  <div class="mb-2"><label class="form-label">Subcategory</label><input name="subcategory" class="form-control" value="${(tx.subcategory||'').replace(/"/g,'&quot;')}"></div>
+  <div class="mb-2"><label class="form-label">Account</label><select name="account" class="form-select"><option value="">Select</option>${acs}</select></div>
+  <div class="mb-2"><label class="form-label">Notes</label><textarea name="notes" class="form-control">${tx.notes||''}</textarea></div></form></div>
+  <div class="modal-footer"><button class="btn btn-primary" onclick="saveEdit()">Save</button></div></div></div></div>`;
+  const holder=document.createElement('div');holder.innerHTML=html;document.body.appendChild(holder.firstChild);const modal=new bootstrap.Modal(document.getElementById('editModal'));modal.show();document.getElementById('editModal').addEventListener('hidden.bs.modal',()=>document.getElementById('editModal').remove());
+}
+async function saveEdit(){const f=document.getElementById('editForm');if(!f.reportValidity())return;const p=Object.fromEntries(new FormData(f).entries());p.amount=Number(p.amount);p.source='Manual';await api('updateTransaction',p);bootstrap.Modal.getInstance(document.getElementById('editModal')).hide();await refreshAll();}
+
+function renderReports(){
+  const r=state.reports||{monthlySummary:[],categoryReport:[],dailyExpenseTrend:[]};const total=r.categoryReport.reduce((s,x)=>s+x.total,0);
+  document.getElementById('reports').innerHTML=`<div class="row g-3"><div class="col-12"><div class="card"><div class="card-body"><h5>Monthly Summary</h5><div class="table-responsive"><table class="table table-sm"><thead><tr><th>Month</th><th>Income</th><th>Expense</th><th>Savings</th></tr></thead><tbody>${r.monthlySummary.map(m=>`<tr><td>${m.month}</td><td>${money(m.income)}</td><td>${money(m.expense)}</td><td>${money(m.savings)}</td></tr>`).join('')}</tbody></table></div></div></div></div>
+  <div class="col-12 col-lg-6"><div class="card"><div class="card-body"><h6>Category Report</h6><canvas id="rCat"></canvas></div></div></div>
+  <div class="col-12 col-lg-6"><div class="card"><div class="card-body"><h6>Daily Expense Trend</h6><canvas id="rDay"></canvas></div></div></div>
+  <div class="col-12"><div class="card"><div class="card-body"><table class="table table-sm"><thead><tr><th>Category</th><th>Total</th><th>%</th></tr></thead><tbody>${r.categoryReport.map(x=>`<tr><td>${x.category}</td><td>${money(x.total)}</td><td>${total?((x.total/total)*100).toFixed(1):0}%</td></tr>`).join('')}</tbody></table></div></div></div></div>`;
+  chart('rCat','pie',{labels:r.categoryReport.map(x=>x.category),datasets:[{data:r.categoryReport.map(x=>x.total)}]});
+  chart('rDay','line',{labels:r.dailyExpenseTrend.map(x=>x.date),datasets:[{label:'Daily Expense',data:r.dailyExpenseTrend.map(x=>x.total),borderColor:'#0d6efd'}]});
+}
+
+function renderSettings(){
+  document.getElementById('settings').innerHTML=`<div class="row g-3">
+  <div class="col-12 col-lg-4"><div class="card"><div class="card-body"><h6>Add Category</h6><form onsubmit="addCategory(event)"><input class="form-control mb-2" name="name" placeholder="Category name" required><select name="type" class="form-select mb-2"><option>Expense</option><option>Income</option></select><input class="form-control mb-2" name="parentCategory" placeholder="Parent category (optional)"><button class="btn btn-primary btn-sm">Add</button></form><hr>${state.categories.map(c=>`<div class="small">• ${c.name} <span class="text-muted">(${c.type})</span></div>`).join('')}</div></div></div>
+  <div class="col-12 col-lg-4"><div class="card"><div class="card-body"><h6>Add Account</h6><form onsubmit="addAccount(event)"><input class="form-control mb-2" name="name" placeholder="Account name" required><input class="form-control mb-2" name="bank" placeholder="Bank"><input class="form-control mb-2" name="currency" value="USD" placeholder="Currency"><input class="form-control mb-2" type="number" step="0.01" name="openingBalance" placeholder="Opening balance"><button class="btn btn-primary btn-sm">Add</button></form><hr>${state.accounts.map(a=>`<div class="small">• ${a.name} (${a.currency})</div>`).join('')}</div></div></div>
+  <div class="col-12 col-lg-4"><div class="card"><div class="card-body"><h6>Add Category Rule</h6><form onsubmit="addRule(event)"><input class="form-control mb-2" name="keyword" placeholder="Keyword" required><select name="category" class="form-select mb-2"><option value="">Select category</option>${state.categories.map(c=>`<option>${c.name}</option>`).join('')}</select><input class="form-control mb-2" name="subcategory" placeholder="Subcategory"><button class="btn btn-primary btn-sm">Add</button></form><hr>${state.rules.map(r=>`<div class="small">• "${r.keyword}" → ${r.category}</div>`).join('')}</div></div></div>
+  </div>`;
+}
+async function addCategory(e){e.preventDefault();await api('addCategory',Object.fromEntries(new FormData(e.target).entries()));e.target.reset();await refreshAll();}
+async function addAccount(e){e.preventDefault();const p=Object.fromEntries(new FormData(e.target).entries());p.openingBalance=Number(p.openingBalance||0);await api('addAccount',p);e.target.reset();await refreshAll();}
+async function addRule(e){e.preventDefault();await api('addCategoryRule',Object.fromEntries(new FormData(e.target).entries()));e.target.reset();await refreshAll();}
+
+function chart(id,type,data){const c=document.getElementById(id);if(!c)return;if(state.charts[id])state.charts[id].destroy();state.charts[id]=new Chart(c,{type,data,options:{responsive:true,maintainAspectRatio:false}})}
+</script>
+<script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
+</body>
+</html>
